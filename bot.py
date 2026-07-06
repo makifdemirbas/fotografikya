@@ -106,7 +106,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("⛔ Bu botu kullanma yetkiniz yok.")
         return ConversationHandler.END
 
-    msg = "👋 Merhaba! WordPress Otomasyon Botuna hoş geldin.\n\nLütfen bir işlem seçin:"
+    msg = "👋 Merhaba! Fotografikya İçerik Gönderme Botuna hoş geldin.\n\nLütfen bir işlem seçin:"
     
     if update.callback_query:
         await update.callback_query.answer()
@@ -128,13 +128,13 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return MENU_ROUTING
 
     elif data == "menu_post":
-        await query.edit_message_text("📸 Lütfen öne çıkan görsel yapmak istediğiniz **fotoğrafı gönderin**.", reply_markup=get_cancel_menu())
+        await query.edit_message_text("📸 Lütfen öne çıkan görsel yapmak istediğiniz fotoğrafı gönderin.", reply_markup=get_cancel_menu())
         return PHOTO
 
     # --- ADMIN YÖNLENDİRMELERİ ---
     elif user_id == ADMIN_ID:
         if data == "menu_admin":
-            await query.edit_message_text("⚙️ **Yönetici Paneli**\nNe yapmak istersiniz?", reply_markup=get_admin_menu())
+            await query.edit_message_text("⚙️ Yönetici Paneli\nNe yapmak istersiniz?", reply_markup=get_admin_menu())
             return MENU_ROUTING
             
         elif data == "admin_list_users":
@@ -147,11 +147,11 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             return MENU_ROUTING
             
         elif data == "admin_add_user":
-            await query.edit_message_text("➕ **Kullanıcı Ekleme**\nLütfen eklenecek kişinin **Telegram User ID**'sini gönderin:", reply_markup=get_cancel_menu())
+            await query.edit_message_text("➕ Kullanıcı Ekleme\nLütfen eklenecek kişinin Telegram User ID'sini gönderin:", reply_markup=get_cancel_menu())
             return ADD_TG_ID
             
         elif data == "admin_del_user":
-            await query.edit_message_text("➖ **Kullanıcı Silme**\nLütfen silinecek kişinin **Telegram User ID**'sini gönderin:", reply_markup=get_cancel_menu())
+            await query.edit_message_text("➖ Kullanıcı Silme\nLütfen silinecek kişinin Telegram User ID'sini gönderin:", reply_markup=get_cancel_menu())
             return DEL_TG_ID
 
     return MENU_ROUTING
@@ -166,12 +166,12 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     await photo_file.download_to_drive(file_path)
     context.user_data['photo_path'] = file_path
 
-    await update.message.reply_text("✅ Görsel alındı.\n📝 Lütfen şimdi yazının **BAŞLIĞINI** gönderin:", reply_markup=get_cancel_menu())
+    await update.message.reply_text("✅ Görsel alındı.\n📝 Lütfen şimdi yazının 'BAŞLIĞINI' gönderin:", reply_markup=get_cancel_menu())
     return TITLE
 
 async def title_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data['title'] = update.message.text.strip()
-    await update.message.reply_text("✅ Başlık kaydedildi.\n✍️ Şimdi lütfen yazının **İÇERİĞİNİ** gönderin:", reply_markup=get_cancel_menu())
+    await update.message.reply_text("✅ Başlık kaydedildi.\n✍️ Şimdi lütfen yazının 'İÇERİĞİNİ' gönderin:", reply_markup=get_cancel_menu())
     return CONTENT
 
 async def content_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -191,11 +191,11 @@ async def content_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             keyboard.append([InlineKeyboardButton(cat['name'], callback_data=f"cat_{cat['id']}")])
         keyboard.append([InlineKeyboardButton("❌ İptal", callback_data="menu_main")])
         
-        await update.message.reply_text("📂 Lütfen bir **kategori seçin:**", reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.message.reply_text("📂 Lütfen bir kategori seçin:", reply_markup=InlineKeyboardMarkup(keyboard))
         return CATEGORY
     except Exception as e:
         logger.error(f"Kategori çekme hatası: {e}")
-        await update.message.reply_text("❌ Kategoriler çekilemedi. Bilgileri kontrol edin.", reply_markup=get_main_menu(user_id))
+        await update.message.reply_text("❌ Kategoriler çekilemedi. Site adresi, kullanıcı adı veya şifreyi kontrol edin.", reply_markup=get_main_menu(user_id))
         return MENU_ROUTING
 
 async def category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -252,12 +252,26 @@ async def category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def admin_add_tg_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data['new_user'] = {"tg_id": update.message.text.strip()}
-    await update.message.reply_text("🌐 Şimdi yeni kullanıcının **WordPress API URL**'sini gönderin:\n*(Örn: https://site.com/wp-json/wp/v2)*", reply_markup=get_cancel_menu())
+    await update.message.reply_text("🌐 Şimdi yeni kullanıcının **WordPress Site Adresini** gönderin:\n*(Örn: https://site.com)*", reply_markup=get_cancel_menu())
     return ADD_WP_URL
 
 async def admin_add_wp_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data['new_user']['wp_url'] = update.message.text.strip().rstrip('/')
-    await update.message.reply_text("👤 Şimdi WordPress **Kullanıcı Adını** gönderin:", reply_markup=get_cancel_menu())
+    raw_url = update.message.text.strip().rstrip('/')
+    
+    # URL YAZIM HATALARINI OTOMATİK DÜZELTME BÖLÜMÜ (3. YÖNTEM İÇİN EKLENDİ)
+    if not raw_url.endswith("/wp-json/wp/v2"):
+        if "/wp-json" in raw_url:
+            # wp-json var ama v2 eksik veya yanlışsa temizleyip doğru ekle
+            base_url = raw_url.split("/wp-json")[0]
+            fixed_url = f"{base_url}/wp-json/wp/v2"
+        else:
+            # Sadece site adresi girildiyse (örn: https://site.com)
+            fixed_url = f"{raw_url}/wp-json/wp/v2"
+    else:
+        fixed_url = raw_url
+        
+    context.user_data['new_user']['wp_url'] = fixed_url
+    await update.message.reply_text(f"✅ URL otomatik algılandı: `{fixed_url}`\n\n👤 Şimdi WordPress **Kullanıcı Adını** gönderin:", parse_mode="Markdown", reply_markup=get_cancel_menu())
     return ADD_WP_USER
 
 async def admin_add_wp_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
