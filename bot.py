@@ -211,7 +211,7 @@ def main() -> None:
             TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, title_handler)],
             CONTENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, content_handler)],
             # Kategori seçimi için yalnızca sayısal (ID) callback'leri yakalar
-            CATEGORY: [CallbackQueryHandler(category_callback, pattern="^\d+$")],
+            CATEGORY: [CallbackQueryHandler(category_callback, pattern=r"^\d+$")],
         },
         fallbacks=[CommandHandler("iptal", cancel)],
     )
