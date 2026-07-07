@@ -2,6 +2,7 @@ import logging
 import requests
 import os
 import json
+import re
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -14,351 +15,520 @@ from telegram.ext import (
 )
 
 # ==========================================
-# 🛑 AYARLAR VE VERİTABANI BAŞLANGICI 🛑
+# 🛑 BİLGİLERİN EKLENDİ 🛑
 # ==========================================
 
-# Telegram Bot Token (GÜVENLİĞİN İÇİN DEĞİŞTİRMELİSİN)
 TELEGRAM_TOKEN = "8952900507:AAGH_Veh5mz3zqZqX9oz8qvr_FCuOAii76s"
+WP_API_URL = "https://fotografikya.net.tr/wp-json/wp/v2"
+WP_USER = "fotografikya"
+WP_APP_PASSWORD = "InZB IDmf a1AA Bm6j qcxA 2l2Q"
 ADMIN_ID = 7649807507
+USERS_FILE = "allowed_users.json"
+LOG_CHANNEL_ID = -1004420671588
 
-# Kullanıcı bilgilerini tutacağımız JSON dosyası
-DB_FILE = "users_db.json"
+# ==========================================
+# 🛑 AYARLAR BİTTİ - AŞAĞISINA DOKUNMA 🛑
+# ==========================================
 
-# Loglama ayarları
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Tüm menü ve konuşma durumları (State Machine)
+# Konuşma Durumları (State Machine)
 (
-    MENU_ROUTING,
-    PHOTO, TITLE, CONTENT, CATEGORY,          # İçerik Yükleme Adımları
-    ADD_TG_ID, ADD_WP_URL, ADD_WP_USER, ADD_WP_PASS, # Kullanıcı Ekleme Adımları
-    DEL_TG_ID                                 # Kullanıcı Silme Adımı
-) = range(10)
+    MAIN_MENU,
+    ADMIN_MENU,
+    WAIT_ADD_ID, WAIT_ADD_USERNAME, WAIT_ADD_PHONE,
+    WAIT_REMOVE_ID, WAIT_REMOVE_USERNAME, WAIT_REMOVE_PHONE,
+    PHOTO, TITLE, CONTENT, CATEGORY,
+    WAIT_SUPPORT_MESSAGE
+) = range(13)
 
-# --- VERİTABANI (JSON) FONKSİYONLARI ---
-
-def load_db():
-    """Kullanıcıları JSON'dan okur. Dosya yoksa oluşturur ve Admin'i ekler."""
-    if not os.path.exists(DB_FILE):
-        # Varsayılan Admin Ayarları ile DB'yi başlat
-        default_db = {
-            str(ADMIN_ID): {
-                "wp_url": "https://fotografikya.net.tr/wp-json/wp/v2",
-                "wp_user": "fotografikya",
-                "wp_app_password": "InZB IDmf a1AA Bm6j qcxA 2l2Q"
-            }
-        }
-        save_db(default_db)
-        return default_db
-    
-    with open(DB_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def save_db(data):
-    """Kullanıcıları JSON'a kaydeder."""
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
-
-def get_user_wp_data(user_id):
-    """Telegram ID'sine göre WordPress bilgilerini getirir."""
-    db = load_db()
-    return db.get(str(user_id))
 
 # ==========================================
-# 📱 MENÜ SİSTEMİ
+# 👥 KULLANICI YÖNETİMİ SİSTEMİ
 # ==========================================
 
-def get_main_menu(user_id):
-    """Ana Menü butonlarını oluşturur."""
-    keyboard = [[InlineKeyboardButton("✍️ Yeni İçerik Ekle", callback_data="menu_post")]]
+def load_users():
+    """Kayıtlı kullanıcıları JSON dosyasından dict olarak yükler."""
+    default_data = {"ids": [], "usernames": [], "phones": []}
+    if os.path.exists(USERS_FILE):
+        try:
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                # Eski sürümden (sadece liste) yeni sürüme (dict) geçiş kontrolü
+                if isinstance(data, list):
+                    return {"ids": data, "usernames": [], "phones": []}
+                return data
+        except Exception as e:
+            logger.error(f"Kullanıcılar yüklenirken hata: {e}")
+            return default_data
+    return default_data
+
+def save_users(users_data):
+    """Kullanıcı verilerini JSON dosyasına kaydeder."""
+    try:
+        with open(USERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(users_data, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        logger.error(f"Kullanıcılar kaydedilirken hata: {e}")
+
+async def send_to_log_channel(context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Log kanalına bilgi mesajı gönderir."""
+    try:
+        await context.bot.send_message(chat_id=LOG_CHANNEL_ID, text=text, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Log kanalına mesaj gönderilemedi: {e}")
+
+def is_user_auth(user) -> bool:
+    """Kullanıcının sisteme erişim yetkisi olup olmadığını kontrol eder."""
+    # Ana yönetici her zaman girebilir
+    if user.id == ADMIN_ID:
+        return True
+
+    users_data = load_users()
     
-    # Sadece Admin ekstra menüyü görür
-    if user_id == ADMIN_ID:
-        keyboard.append([InlineKeyboardButton("👥 Kullanıcıları Yönet (Admin)", callback_data="menu_admin")])
+    # 1. ID Kontrolü
+    if user.id in users_data.get("ids", []):
+        return True
         
-    return InlineKeyboardMarkup(keyboard)
+    # 2. Kullanıcı Adı Kontrolü
+    if user.username:
+        clean_username = user.username.lower().replace("@", "")
+        saved_usernames = [u.lower().replace("@", "") for u in users_data.get("usernames", [])]
+        if clean_username in saved_usernames:
+            return True
 
-def get_admin_menu():
-    """Yönetici Menüsü butonlarını oluşturur."""
-    keyboard = [
-        [InlineKeyboardButton("➕ Kullanıcı Ekle", callback_data="admin_add_user")],
-        [InlineKeyboardButton("➖ Kullanıcı Sil", callback_data="admin_del_user")],
-        [InlineKeyboardButton("📋 Kullanıcı Listesi", callback_data="admin_list_users")],
-        [InlineKeyboardButton("🔙 Ana Menüye Dön", callback_data="menu_main")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def get_cancel_menu():
-    """İptal/Geri dön butonu."""
-    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ İşlemi İptal Et", callback_data="menu_main")]])
+    return False
 
 # ==========================================
-# 🚀 BAŞLANGIÇ VE YÖNLENDİRİCİ
+# 📱 MENÜ VE ARAYÜZ YÖNETİMİ
 # ==========================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Bot /start komutu ile ana menüyü açar."""
-    user_id = update.effective_user.id
-    wp_data = get_user_wp_data(user_id)
-
-    if not wp_data and user_id != ADMIN_ID:
-        await update.message.reply_text("⛔ Bu botu kullanma yetkiniz yok.")
-        return ConversationHandler.END
-
-    msg = "👋 Merhaba! Fotografikya İçerik Gönderme Botuna hoş geldin.\n\nLütfen bir işlem seçin:"
+    """Botu başlatır ve kişiselleştirilmiş ana menüyü gösterir."""
+    user = update.effective_user
     
+    # Kullanıcı ismi ile hitap
+    first_name = user.first_name or ""
+    last_name = user.last_name or ""
+    full_name = f"{first_name} {last_name}".strip()
+
+    msg = f"👋 Merhaba {full_name}!\n\n"
+    keyboard = []
+
+    if is_user_auth(user):
+        msg += "Fotografikya İçerik Gönderme Botuna Hoş Geldin.\nLütfen yapmak istediğin işlemi aşağıdan seç:"
+        keyboard.append([InlineKeyboardButton("📝 Yeni İçerik Ekle", callback_data="add_post")])
+        
+        # Sadece ana yöneticiye Kullanıcı Yönetimi butonunu göster
+        if user.id == ADMIN_ID:
+            keyboard.append([InlineKeyboardButton("👥 Kullanıcı Yönetimi", callback_data="user_mgmt")])
+    else:
+        msg += "⛔ Bu botu kullanma yetkiniz bulunmuyor.\nYetki talep etmek veya bizimle iletişime geçmek için aşağıdan destek talebi oluşturabilirsiniz."
+
+    # Herkese destek talebi butonu gösterilir
+    keyboard.append([InlineKeyboardButton("📞 Destek Talebi", callback_data="support_ticket")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
     if update.callback_query:
         await update.callback_query.answer()
-        await update.callback_query.edit_message_text(msg, reply_markup=get_main_menu(user_id))
+        await update.callback_query.edit_message_text(msg, reply_markup=reply_markup)
     else:
-        await update.message.reply_text(msg, reply_markup=get_main_menu(user_id))
+        await update.message.reply_text(msg, reply_markup=reply_markup)
         
-    return MENU_ROUTING
+    return MAIN_MENU
 
-async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Buton tıklamalarını ilgili durumlara yönlendirir."""
+# --- YÖNETİCİ MENÜSÜ ---
+async def show_user_management(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Kullanıcı Yönetimi ana menüsünü gösterir."""
+    if update.effective_user.id != ADMIN_ID:
+        await update.callback_query.answer("⛔ Bu alana sadece ana yönetici girebilir!", show_alert=True)
+        return MAIN_MENU
+        
     query = update.callback_query
     await query.answer()
-    data = query.data
-    user_id = update.effective_user.id
 
-    if data == "menu_main":
-        await query.edit_message_text("🏠 Ana Menü:", reply_markup=get_main_menu(user_id))
-        return MENU_ROUTING
+    keyboard = [
+        [InlineKeyboardButton("➕ Yeni Kullanıcı Ekle", callback_data="admin_add")],
+        [InlineKeyboardButton("➖ Kullanıcı Sil", callback_data="admin_remove")],
+        [InlineKeyboardButton("📋 Yetkilileri Listele", callback_data="admin_list")],
+        [InlineKeyboardButton("🔙 Ana Menüye Dön", callback_data="back_main")]
+    ]
+    await query.edit_message_text("👥 **Kullanıcı Yönetimi Paneli**\n\nLütfen bir işlem seçin:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    return ADMIN_MENU
 
-    elif data == "menu_post":
-        await query.edit_message_text("📸 Lütfen öne çıkan görsel yapmak istediğiniz fotoğrafı gönderin.", reply_markup=get_cancel_menu())
-        return PHOTO
+async def admin_list_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Kayıtlı tüm kullanıcıları listeler."""
+    query = update.callback_query
+    await query.answer()
+    users_data = load_users()
 
-    # --- ADMIN YÖNLENDİRMELERİ ---
-    elif user_id == ADMIN_ID:
-        if data == "menu_admin":
-            await query.edit_message_text("⚙️ Yönetici Paneli\nNe yapmak istersiniz?", reply_markup=get_admin_menu())
-            return MENU_ROUTING
-            
-        elif data == "admin_list_users":
-            db = load_db()
-            text = "📋 **Kayıtlı Kullanıcılar:**\n\n"
-            for t_id, info in db.items():
-                role = "(👑 Admin)" if int(t_id) == ADMIN_ID else ""
-                text += f"👤 TG ID: `{t_id}` {role}\n🌐 Site: {info['wp_url'].split('/wp-json')[0]}\n\n"
-            await query.edit_message_text(text, reply_markup=get_admin_menu(), parse_mode='Markdown')
-            return MENU_ROUTING
-            
-        elif data == "admin_add_user":
-            await query.edit_message_text("➕ Kullanıcı Ekleme\nLütfen eklenecek kişinin Telegram User ID'sini gönderin:", reply_markup=get_cancel_menu())
-            return ADD_TG_ID
-            
-        elif data == "admin_del_user":
-            await query.edit_message_text("➖ Kullanıcı Silme\nLütfen silinecek kişinin Telegram User ID'sini gönderin:", reply_markup=get_cancel_menu())
-            return DEL_TG_ID
+    msg = "📋 **Güncel Yetkili Listesi**\n\n"
+    
+    msg += "🆔 **ID'ler:**\n"
+    for uid in users_data.get("ids", []): msg += f"- `{uid}`\n"
+    if not users_data.get("ids"): msg += "- Yok\n"
 
-    return MENU_ROUTING
+    msg += "\n👤 **Kullanıcı Adları:**\n"
+    for uname in users_data.get("usernames", []): msg += f"- @{uname}\n"
+    if not users_data.get("usernames"): msg += "- Yok\n"
+
+    msg += "\n📱 **Telefon Numaraları:**\n"
+    for phone in users_data.get("phones", []): msg += f"- {phone}\n"
+    if not users_data.get("phones"): msg += "- Yok\n"
+
+    keyboard = [[InlineKeyboardButton("🔙 Geri Dön", callback_data="user_mgmt")]]
+    await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    return ADMIN_MENU
+
+async def show_add_method_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Kullanıcı ekleme yöntemini (ID, Username, Telefon) sorar."""
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [
+        [InlineKeyboardButton("🆔 ID ile Ekle", callback_data="add_id")],
+        [InlineKeyboardButton("👤 Kullanıcı Adı ile Ekle", callback_data="add_username")],
+        [InlineKeyboardButton("📱 Telefon ile Ekle", callback_data="add_phone")],
+        [InlineKeyboardButton("🔙 İptal / Geri Dön", callback_data="user_mgmt")]
+    ]
+    await query.edit_message_text("➕ Kullanıcıyı hangi yöntemle eklemek istersiniz?", reply_markup=InlineKeyboardMarkup(keyboard))
+    return ADMIN_MENU
+
+async def show_remove_method_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Kullanıcı silme yöntemini sorar."""
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [
+        [InlineKeyboardButton("🆔 ID ile Sil", callback_data="rem_id")],
+        [InlineKeyboardButton("👤 Kullanıcı Adı ile Sil", callback_data="rem_username")],
+        [InlineKeyboardButton("📱 Telefon ile Sil", callback_data="rem_phone")],
+        [InlineKeyboardButton("🔙 İptal / Geri Dön", callback_data="user_mgmt")]
+    ]
+    await query.edit_message_text("➖ Kullanıcıyı hangi yöntemle silmek istersiniz?", reply_markup=InlineKeyboardMarkup(keyboard))
+    return ADMIN_MENU
+
+# --- GİRİŞ BEKLEME İŞLEMLERİ ---
+async def prompt_input(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt_msg: str, next_state: int) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(f"{prompt_msg}\n\n*(İşlemi iptal etmek için /iptal yazabilirsiniz)*")
+    return next_state
+
+# --- EKLEME VE SİLME İŞLEYİCİLERİ ---
+async def process_user_change(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str, is_add: bool, data_type: type = str) -> int:
+    """Kullanıcı ekleme ve silme mantığını işler."""
+    val = update.message.text.strip()
+    
+    try:
+        if data_type == int:
+            val = int(val)
+    except ValueError:
+        await update.message.reply_text("⚠️ Hatalı format. İşlem iptal edildi.\n/start ile menüye dönebilirsiniz.")
+        return ConversationHandler.END
+
+    users_data = load_users()
+    
+    if is_add:
+        if val not in users_data[key]:
+            users_data[key].append(val)
+            msg = f"✅ Başarıyla eklendi: {val}"
+            await send_to_log_channel(context, f"⚙️ **Yeni Kullanıcı Eklendi**\n👤 Yönetici: {update.effective_user.full_name}\n➕ Eklenen: `{val}`\n🗂 Tür: {key.upper()}")
+        else:
+            msg = f"⚠️ Zaten ekli: {val}"
+    else:
+        if val in users_data[key]:
+            users_data[key].remove(val)
+            msg = f"✅ Başarıyla silindi: {val}"
+            await send_to_log_channel(context, f"⚙️ **Kullanıcı Silindi**\n👤 Yönetici: {update.effective_user.full_name}\n➖ Silinen: `{val}`\n🗂 Tür: {key.upper()}")
+        else:
+            msg = f"⚠️ Listede bulunamadı: {val}"
+
+    save_users(users_data)
+    
+    keyboard = [[InlineKeyboardButton("🔙 Kullanıcı Yönetimi", callback_data="user_mgmt")]]
+    await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+    return MAIN_MENU
+
+# Fonksiyon sarmalayıcılar
+async def handle_add_id(u: Update, c: ContextTypes.DEFAULT_TYPE): return await process_user_change(u, c, "ids", True, int)
+async def handle_add_username(u: Update, c: ContextTypes.DEFAULT_TYPE): return await process_user_change(u, c, "usernames", True, str)
+async def handle_add_phone(u: Update, c: ContextTypes.DEFAULT_TYPE): return await process_user_change(u, c, "phones", True, str)
+async def handle_rem_id(u: Update, c: ContextTypes.DEFAULT_TYPE): return await process_user_change(u, c, "ids", False, int)
+async def handle_rem_username(u: Update, c: ContextTypes.DEFAULT_TYPE): return await process_user_change(u, c, "usernames", False, str)
+async def handle_rem_phone(u: Update, c: ContextTypes.DEFAULT_TYPE): return await process_user_change(u, c, "phones", False, str)
+
 
 # ==========================================
-# ✍️ İÇERİK EKLEME AKIŞI (POST FLOW)
+# 📝 İÇERİK EKLEME SİHİRBAZI
 # ==========================================
+
+async def start_post_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """İçerik sihirbazını başlatır."""
+    if not is_user_auth(update.effective_user):
+        await update.callback_query.answer("⛔ İçerik ekleme yetkiniz yok!", show_alert=True)
+        return MAIN_MENU
+
+    query = update.callback_query
+    await query.answer()
+    
+    msg = (
+        "📸 İçerik Sihirbazı Başlıyor...\n\n"
+        "👉 Lütfen öne çıkan görsel yapmak istediğiniz **fotoğrafı gönderin**.\n"
+        "*(İşlemi iptal etmek için /iptal yazabilirsiniz)*"
+    )
+    await query.edit_message_text(msg)
+    return PHOTO
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Fotoğrafı alır ve hafızaya kaydeder, ardından başlığı ister."""
     photo_file = await update.message.photo[-1].get_file()
-    file_path = f"temp_{update.effective_user.id}.jpg"
+    file_path = "temp_image.jpg"
     await photo_file.download_to_drive(file_path)
     context.user_data['photo_path'] = file_path
 
-    await update.message.reply_text("✅ Görsel alındı.\n📝 Lütfen şimdi yazının 'BAŞLIĞINI' gönderin:", reply_markup=get_cancel_menu())
+    await update.message.reply_text("📸 Görsel alındı!\n\n📝 Şimdi lütfen yazının **BAŞLIĞINI** gönderin.")
     return TITLE
 
 async def title_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Başlığı alır ve içeriği ister."""
     context.user_data['title'] = update.message.text.strip()
-    await update.message.reply_text("✅ Başlık kaydedildi.\n✍️ Şimdi lütfen yazının 'İÇERİĞİNİ' gönderin:", reply_markup=get_cancel_menu())
+    await update.message.reply_text("✅ Başlık kaydedildi.\n\n✍️ Şimdi lütfen yazının **İÇERİĞİNİ** gönderin.")
     return CONTENT
 
 async def content_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """İçeriği alır, WordPress'ten kategorileri çeker."""
     context.user_data['content'] = update.message.text.strip()
-    user_id = update.effective_user.id
-    wp_data = get_user_wp_data(user_id)
-    
-    await update.message.reply_text("⏳ WordPress'ten kategoriler çekiliyor...")
+    msg = await update.message.reply_text("✅ İçerik kaydedildi. Kategoriler getiriliyor, lütfen bekleyin...")
 
     try:
-        response = requests.get(f"{wp_data['wp_url']}/categories", auth=(wp_data['wp_user'], wp_data['wp_app_password']))
+        response = requests.get(f"{WP_API_URL}/categories", auth=(WP_USER, WP_APP_PASSWORD))
         response.raise_for_status()
         categories = response.json()
         
         keyboard = []
         for cat in categories:
-            keyboard.append([InlineKeyboardButton(cat['name'], callback_data=f"cat_{cat['id']}")])
-        keyboard.append([InlineKeyboardButton("❌ İptal", callback_data="menu_main")])
+            keyboard.append([InlineKeyboardButton(cat['name'], callback_data=str(cat['id']))])
         
-        await update.message.reply_text("📂 Lütfen bir kategori seçin:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await msg.edit_text("📂 Lütfen bu yazı için bir **kategori seçin:**", reply_markup=InlineKeyboardMarkup(keyboard))
         return CATEGORY
     except Exception as e:
-        logger.error(f"Kategori çekme hatası: {e}")
-        await update.message.reply_text("❌ Kategoriler çekilemedi. Site adresi, kullanıcı adı veya şifreyi kontrol edin.", reply_markup=get_main_menu(user_id))
-        return MENU_ROUTING
+        logger.error(f"Kategori hatası: {e}")
+        keyboard = [[InlineKeyboardButton("🔄 Ana Menüye Dön", callback_data="restart")]]
+        await msg.edit_text("❌ Kategoriler çekilirken hata oluştu.", reply_markup=InlineKeyboardMarkup(keyboard))
+        return MAIN_MENU
 
 async def category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Görseli yükler ve yazıyı paylaşır."""
     query = update.callback_query
     await query.answer()
-    user_id = update.effective_user.id
-    wp_data = get_user_wp_data(user_id)
     
-    # Callback verisinden kategori ID'yi al (örnek: "cat_15")
-    category_id = int(query.data.split("_")[1])
-    
-    title = context.user_data.get('title')
-    content = context.user_data.get('content')
-    photo_path = context.user_data.get('photo_path')
+    category_id = int(query.data)
+    title = context.user_data.get('title', '')
+    content = context.user_data.get('content', '')
+    photo_path = context.user_data.get('photo_path', '')
 
-    await query.edit_message_text("⏳ Seçim yapıldı! Yazı WordPress'e yükleniyor...")
+    await query.edit_message_text("⏳ İşlem başlatılıyor. Fotoğraf yüklenip içerik yayınlanıyor (Bu biraz sürebilir)...")
 
     try:
         # 1. Görseli Yükle
-        media_url = f"{wp_data['wp_url']}/media"
-        headers = {'Content-Disposition': f'attachment; filename="bot_gorsel_{user_id}.jpg"', 'Content-Type': 'image/jpeg'}
+        media_url = f"{WP_API_URL}/media"
+        headers = {'Content-Disposition': 'attachment; filename="telegram_gorsel.jpg"', 'Content-Type': 'image/jpeg'}
         with open(photo_path, 'rb') as f:
-            media_res = requests.post(media_url, headers=headers, auth=(wp_data['wp_user'], wp_data['wp_app_password']), data=f)
+            media_res = requests.post(media_url, headers=headers, auth=(WP_USER, WP_APP_PASSWORD), data=f)
         media_res.raise_for_status()
         media_id = media_res.json().get('id')
 
         # 2. İçeriği Yayınla
-        post_url = f"{wp_data['wp_url']}/posts"
+        post_url = f"{WP_API_URL}/posts"
         post_data = {
             'title': title,
             'content': content,
-            'status': 'publish',
+            'status': 'publish', 
             'featured_media': media_id,
             'categories': [category_id]
         }
-        post_res = requests.post(post_url, auth=(wp_data['wp_user'], wp_data['wp_app_password']), json=post_data)
+        post_res = requests.post(post_url, auth=(WP_USER, WP_APP_PASSWORD), json=post_data)
         post_res.raise_for_status()
         post_link = post_res.json().get('link')
 
-        await query.message.reply_text(f"✅ **Yazı başarıyla yayınlandı!**\n\n🔗 [Yazıyı Görüntüle]({post_link})", reply_markup=get_main_menu(user_id), parse_mode='Markdown', disable_web_page_preview=True)
+        keyboard = [[InlineKeyboardButton("🔙 Ana Menüye Dön", callback_data="restart")]]
+        await query.message.reply_text(f"✅ Yazı başarıyla yayınlandı!\n\n🔗 Link: {post_link}", reply_markup=InlineKeyboardMarkup(keyboard))
+
+        # Log kanalına bildir
+        await send_to_log_channel(
+            context, 
+            f"✅ **Yeni İçerik Yayınlandı!**\n"
+            f"👤 Ekleyen: {update.effective_user.full_name} (@{update.effective_user.username})\n"
+            f"📝 Başlık: {title}\n"
+            f"🔗 [Yazıyı Görüntüle]({post_link})"
+        )
+
     except Exception as e:
-        logger.error(f"Yükleme hatası: {e}")
-        await query.message.reply_text("❌ Yükleme sırasında bir hata oluştu.", reply_markup=get_main_menu(user_id))
+        logger.error(f"Yayınlama hatası: {e}")
+        keyboard = [[InlineKeyboardButton("🔙 Ana Menüye Dön", callback_data="restart")]]
+        await query.message.reply_text("❌ Yükleme sırasında bir hata oluştu.", reply_markup=InlineKeyboardMarkup(keyboard))
+        await send_to_log_channel(context, f"❌ **İçerik Yükleme Hatası**\n👤 Kullanıcı: {update.effective_user.full_name}\n⚠️ Hata: {e}")
     finally:
-        if photo_path and os.path.exists(photo_path):
+        if os.path.exists(photo_path):
             os.remove(photo_path)
-            context.user_data.pop('photo_path', None)
 
-    return MENU_ROUTING
+    return MAIN_MENU
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """İşlemi iptal eder ve ana menü butonunu gösterir."""
+    if 'photo_path' in context.user_data and os.path.exists(context.user_data['photo_path']):
+        os.remove(context.user_data['photo_path'])
+        
+    keyboard = [[InlineKeyboardButton("🔙 Ana Menüye Dön", callback_data="restart")]]
+    await update.message.reply_text("🛑 İşlem iptal edildi.", reply_markup=InlineKeyboardMarkup(keyboard))
+    return MAIN_MENU
 
 # ==========================================
-# 👥 ADMİN KULLANICI EKLEME AKIŞI
+# 📞 DESTEK SİSTEMİ
 # ==========================================
 
-async def admin_add_tg_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data['new_user'] = {"tg_id": update.message.text.strip()}
-    await update.message.reply_text("🌐 Şimdi yeni kullanıcının **WordPress Site Adresini** gönderin:\n*(Örn: https://site.com)*", reply_markup=get_cancel_menu())
-    return ADD_WP_URL
-
-async def admin_add_wp_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    raw_url = update.message.text.strip().rstrip('/')
+async def start_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Destek talebi menüsünü başlatır."""
+    query = update.callback_query
+    await query.answer()
     
-    # URL YAZIM HATALARINI OTOMATİK DÜZELTME BÖLÜMÜ (3. YÖNTEM İÇİN EKLENDİ)
-    if not raw_url.endswith("/wp-json/wp/v2"):
-        if "/wp-json" in raw_url:
-            # wp-json var ama v2 eksik veya yanlışsa temizleyip doğru ekle
-            base_url = raw_url.split("/wp-json")[0]
-            fixed_url = f"{base_url}/wp-json/wp/v2"
+    keyboard = [[InlineKeyboardButton("🔙 İptal / Ana Menü", callback_data="restart")]]
+    await query.edit_message_text(
+        "📞 **Destek Talebi**\n\nLütfen yetkililere iletmek istediğiniz mesajı aşağıya yazın.\n\n*(İşlemi iptal etmek için butonu kullanabilir veya /iptal yazabilirsiniz)*",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    return WAIT_SUPPORT_MESSAGE
+
+async def receive_support_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Kullanıcının destek mesajını alır ve log kanalına iletir."""
+    user = update.effective_user
+    message_text = update.message.text
+
+    log_msg = (
+        f"📢 **YENİ DESTEK TALEBİ**\n"
+        f"👤 Gönderen: {user.full_name} (@{user.username})\n"
+        f"🆔 ID: `{user.id}`\n\n"
+        f"📝 Mesaj:\n{message_text}"
+    )
+
+    await send_to_log_channel(context, log_msg)
+
+    keyboard = [[InlineKeyboardButton("🔙 Ana Menüye Dön", callback_data="restart")]]
+    await update.message.reply_text(
+        "✅ Mesajınız yetkililere başarıyla iletildi. En kısa sürede size dönüş yapılacaktır.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return MAIN_MENU
+
+async def support_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Log kanalından gelen yanıtları asıl kullanıcıya iletir."""
+    msg = update.effective_message
+    
+    # Eğer bir mesaja yanıt verilmiyorsa işlemi sonlandır
+    if not msg or not msg.reply_to_message:
+        return
+
+    replied_text = msg.reply_to_message.text or msg.reply_to_message.caption
+    if not replied_text:
+        return
+
+    # Yalnızca destek taleplerindeki ID'yi bulduğunda çalışır
+    match = re.search(r"🆔 ID:\s*`?(\d+)`?", replied_text)
+    if not match:
+        return
+
+    user_id = int(match.group(1))
+    
+    # Yetkilinin mesajı veya medyası var mı?
+    reply_text = msg.text or msg.caption or "*(Destek ekibi size bir dosya/medya gönderdi)*"
+
+    try:
+        if msg.text:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"📞 **Destek Ekibinden Yanıt Geldi:**\n\n{reply_text}",
+                parse_mode="Markdown"
+            )
         else:
-            # Sadece site adresi girildiyse (örn: https://site.com)
-            fixed_url = f"{raw_url}/wp-json/wp/v2"
-    else:
-        fixed_url = raw_url
-        
-    context.user_data['new_user']['wp_url'] = fixed_url
-    await update.message.reply_text(f"✅ URL otomatik algılandı: `{fixed_url}`\n\n👤 Şimdi WordPress **Kullanıcı Adını** gönderin:", parse_mode="Markdown", reply_markup=get_cancel_menu())
-    return ADD_WP_USER
+            # Medya (Fotoğraf vb.) dosyası ise doğrudan kopyala
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="📞 **Destek Ekibinden Yanıt Geldi:**",
+                parse_mode="Markdown"
+            )
+            await msg.copy(chat_id=user_id)
 
-async def admin_add_wp_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data['new_user']['wp_user'] = update.message.text.strip()
-    await update.message.reply_text("🔑 Son olarak WordPress **Uygulama Şifresini** gönderin:", reply_markup=get_cancel_menu())
-    return ADD_WP_PASS
-
-async def admin_add_wp_pass(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    wp_pass = update.message.text.strip()
-    new_user = context.user_data['new_user']
-    
-    db = load_db()
-    db[new_user['tg_id']] = {
-        "wp_url": new_user['wp_url'],
-        "wp_user": new_user['wp_user'],
-        "wp_app_password": wp_pass
-    }
-    save_db(db)
-    
-    context.user_data.pop('new_user', None)
-    await update.message.reply_text(f"✅ Kullanıcı `{new_user['tg_id']}` sisteme başarıyla eklendi!", reply_markup=get_admin_menu(), parse_mode='Markdown')
-    return MENU_ROUTING
-
-# ==========================================
-# 🗑️ ADMİN KULLANICI SİLME AKIŞI
-# ==========================================
-
-async def admin_del_tg_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    target_id = update.message.text.strip()
-    
-    if target_id == str(ADMIN_ID):
-        await update.message.reply_text("⚠️ Kendinizi (Admin) silemezsiniz!", reply_markup=get_admin_menu())
-        return MENU_ROUTING
-        
-    db = load_db()
-    if target_id in db:
-        del db[target_id]
-        save_db(db)
-        await update.message.reply_text(f"✅ `{target_id}` ID'li kullanıcı silindi.", reply_markup=get_admin_menu(), parse_mode='Markdown')
-    else:
-        await update.message.reply_text("❌ Böyle bir kullanıcı bulunamadı.", reply_markup=get_admin_menu())
-        
-    return MENU_ROUTING
-
-# ==========================================
-# 🛑 ANA FONKSİYON VE YAPI
-# ==========================================
+        await msg.reply_text("✅ Yanıtınız kullanıcıya başarıyla iletildi.")
+    except Exception as e:
+        logger.error(f"Kullanıcıya yanıt iletilemedi: {e}")
+        await msg.reply_text(f"❌ Yanıt iletilemedi. (Kullanıcı botu engellemiş veya ID hatalı olabilir)\nHata Detayı: {e}")
 
 def main() -> None:
-    # Veritabanını ilk kez kontrol et/oluştur
-    load_db()
-
+    """Botu çalıştırır."""
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Tek, kapsayıcı bir ConversationHandler
+    # Log kanalındaki mesaj yanıtlarını yakalayan handler (Sohbet döngüsünden bağımsız her zaman çalışır)
+    application.add_handler(MessageHandler(
+        filters.Chat(LOG_CHANNEL_ID) & filters.REPLY, 
+        support_reply_handler
+    ))
+
     conv_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler("start", start),
-            CallbackQueryHandler(start, pattern="^menu_main$")
-        ],
+        entry_points=[CommandHandler("start", start), CallbackQueryHandler(start, pattern="^restart$")],
         states={
-            MENU_ROUTING: [CallbackQueryHandler(menu_router)],
+            MAIN_MENU: [
+                CallbackQueryHandler(start_post_wizard, pattern="^add_post$"),
+                CallbackQueryHandler(show_user_management, pattern="^user_mgmt$"),
+                CallbackQueryHandler(start_support, pattern="^support_ticket$"),
+            ],
+            ADMIN_MENU: [
+                CallbackQueryHandler(start, pattern="^back_main$"),
+                CallbackQueryHandler(show_user_management, pattern="^user_mgmt$"),
+                CallbackQueryHandler(admin_list_users, pattern="^admin_list$"),
+                
+                CallbackQueryHandler(show_add_method_menu, pattern="^admin_add$"),
+                CallbackQueryHandler(show_remove_method_menu, pattern="^admin_remove$"),
+                
+                # Ekleme metotları seçimi
+                CallbackQueryHandler(lambda u, c: prompt_input(u, c, "Lütfen eklenecek kişinin TELEGRAM ID'sini yazın:", WAIT_ADD_ID), pattern="^add_id$"),
+                CallbackQueryHandler(lambda u, c: prompt_input(u, c, "Lütfen eklenecek kişinin KULLANICI ADINI (@ olmadan) yazın:", WAIT_ADD_USERNAME), pattern="^add_username$"),
+                CallbackQueryHandler(lambda u, c: prompt_input(u, c, "Lütfen eklenecek kişinin TELEFON NUMARASINI (Örn: +90555...) yazın:", WAIT_ADD_PHONE), pattern="^add_phone$"),
+                
+                # Silme metotları seçimi
+                CallbackQueryHandler(lambda u, c: prompt_input(u, c, "Lütfen silinecek kişinin TELEGRAM ID'sini yazın:", WAIT_REMOVE_ID), pattern="^rem_id$"),
+                CallbackQueryHandler(lambda u, c: prompt_input(u, c, "Lütfen silinecek kişinin KULLANICI ADINI (@ olmadan) yazın:", WAIT_REMOVE_USERNAME), pattern="^rem_username$"),
+                CallbackQueryHandler(lambda u, c: prompt_input(u, c, "Lütfen silinecek kişinin TELEFON NUMARASINI yazın:", WAIT_REMOVE_PHONE), pattern="^rem_phone$"),
+            ],
             
-            # İçerik Ekleme Adımları
+            # Ekleme Girişleri
+            WAIT_ADD_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_id)],
+            WAIT_ADD_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_username)],
+            WAIT_ADD_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_phone)],
+            
+            # Silme Girişleri
+            WAIT_REMOVE_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_rem_id)],
+            WAIT_REMOVE_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_rem_username)],
+            WAIT_REMOVE_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_rem_phone)],
+
+            # Destek Sistemi Girişi
+            WAIT_SUPPORT_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_support_ticket)],
+
+            # WordPress Sihirbazı
             PHOTO: [MessageHandler(filters.PHOTO, photo_handler)],
             TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, title_handler)],
             CONTENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, content_handler)],
-            CATEGORY: [CallbackQueryHandler(category_callback, pattern="^cat_\d+$")],
-            
-            # Kullanıcı Ekleme Adımları
-            ADD_TG_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_tg_id)],
-            ADD_WP_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_wp_url)],
-            ADD_WP_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_wp_user)],
-            ADD_WP_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_wp_pass)],
-            
-            # Kullanıcı Silme Adımı
-            DEL_TG_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_del_tg_id)],
+            CATEGORY: [CallbackQueryHandler(category_callback, pattern=r"^\d+$")],
         },
-        fallbacks=[
-            CommandHandler("start", start),
-            CallbackQueryHandler(menu_router, pattern="^menu_main$") # İptal butonları için fallback
-        ],
+        fallbacks=[CommandHandler("iptal", cancel), CommandHandler("start", start)],
     )
 
     application.add_handler(conv_handler)
     
-    print("✅ Bot başarıyla çalışıyor! Telegram'a gidip /start yazabilirsin...")
+    print("✅ Bot başarıyla çalışıyor! Menü sistemini test etmek için telegram'a gidip /start yazın.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
